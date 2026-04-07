@@ -561,19 +561,72 @@ def load_layer_function_map(layer: str, json_dir: Path) -> Dict[str, Dict[str, L
     return normalized
 
 
-def get_required_functions(report: ParsedReport, json_dir: Path) -> List[str]:
-    layer_map = load_layer_function_map(report.meta.layer, json_dir)
+def build_component_unit_candidates(meta: ReportMeta) -> List[Tuple[str, str]]:
+    candidates: List[Tuple[str, str]] = []
+
+    parsed_component = clean_text(meta.component)
+    parsed_unit = clean_text(meta.unit)
+    if parsed_component and parsed_unit:
+        candidates.append((parsed_component, parsed_unit))
+
+    file_name = clean_text(meta.file_name)
+    layer = clean_text(meta.layer)
+    if not file_name or not layer:
+        return candidates
+
+    middle_match = re.match(
+        rf"^{re.escape(layer)}_(?P<middle>.+)_UT_Report\.html$",
+        file_name,
+        re.IGNORECASE,
+    )
+    if not middle_match:
+        return candidates
+
+    middle = clean_text(middle_match.group("middle"))
+    parts = [part for part in middle.split("_") if part]
+    for split_idx in range(1, len(parts)):
+        component = "_".join(parts[:split_idx])
+        unit = "_".join(parts[split_idx:])
+        candidate = (component, unit)
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    return candidates
+
+
+def resolve_required_functions(
+    report: ParsedReport,
+    json_dir: Path,
+) -> Tuple[List[str], Optional[Tuple[str, str]], List[Tuple[str, str]]]:
+    return resolve_required_functions_from_meta(report.meta, json_dir)
+
+
+def resolve_required_functions_from_meta(
+    meta: ReportMeta,
+    json_dir: Path,
+) -> Tuple[List[str], Optional[Tuple[str, str]], List[Tuple[str, str]]]:
+    layer_map = load_layer_function_map(meta.layer, json_dir)
+    candidates = build_component_unit_candidates(meta)
     if not layer_map:
-        return []
+        return [], None, candidates
 
-    comp_key = clean_text(report.meta.component).lower()
-    unit_key = clean_text(report.meta.unit).lower()
+    for component, unit in candidates:
+        comp_key = clean_text(component).lower()
+        unit_key = clean_text(unit).lower()
+        comp_map = layer_map.get(comp_key, {})
+        if not comp_map:
+            continue
 
-    comp_map = layer_map.get(comp_key, {})
-    if not comp_map:
-        return []
+        required = comp_map.get(unit_key, [])
+        if required:
+            return required, (component, unit), candidates
 
-    return comp_map.get(unit_key, [])
+    return [], None, candidates
+
+
+def get_required_functions(report: ParsedReport, json_dir: Path) -> List[str]:
+    required, _, _ = resolve_required_functions(report, json_dir)
+    return required
 
 
 # ============================================================
@@ -626,6 +679,47 @@ def is_input_expected_identical(tc: TestCaseInfo) -> bool:
     return build_row_signature(tc.input_rows) == build_row_signature(tc.expected_rows)
 
 
+def get_contextual_data_signatures(
+    rows: List[DataRow],
+) -> Set[Tuple[Tuple[str, ...], str, str, str]]:
+    signatures: Set[Tuple[Tuple[str, ...], str, str, str]] = set()
+    context_by_level: Dict[int, str] = {}
+
+    for row in rows:
+        level = row.level
+        name = clean_text(row.name)
+        data_type = clean_text(row.data_type)
+        value = clean_text(row.value)
+
+        # Keep hierarchy synchronized with current row level.
+        for existing_level in sorted(list(context_by_level.keys()), reverse=True):
+            if existing_level >= level:
+                del context_by_level[existing_level]
+        if name:
+            context_by_level[level] = name.lower()
+
+        # Compare only real value rows.
+        if not data_type and not value:
+            continue
+
+        parent_path = tuple(
+            context_by_level[idx]
+            for idx in sorted(context_by_level.keys())
+            if idx < level
+        )
+        signatures.add((parent_path, name.lower(), data_type.lower(), value.lower()))
+
+    return signatures
+
+
+def get_shared_contextual_inputs(
+    tc: TestCaseInfo,
+) -> Set[Tuple[Tuple[str, ...], str, str, str]]:
+    input_signatures = get_contextual_data_signatures(tc.input_rows)
+    expected_signatures = get_contextual_data_signatures(tc.expected_rows)
+    return input_signatures & expected_signatures
+
+
 def get_metric_short_names(metrics: List[FunctionMetric]) -> Set[str]:
     result: Set[str] = set()
     for metric in metrics:
@@ -635,7 +729,11 @@ def get_metric_short_names(metrics: List[FunctionMetric]) -> Set[str]:
     return result
 
 
-def run_quality_checks(report: ParsedReport, json_dir: Path) -> QualityResult:
+def run_quality_checks(
+    report: ParsedReport,
+    json_dir: Path,
+    required_functions: Optional[List[str]] = None,
+) -> QualityResult:
     result = QualityResult()
 
     if report.overall.statements_percent < 100.0:
@@ -648,7 +746,8 @@ def run_quality_checks(report: ParsedReport, json_dir: Path) -> QualityResult:
             f"Overall Branch Coverage is not 100%: {report.overall.branches_covered} / {report.overall.branches_total} ({report.overall.branches_percent:.1f}%)"
         )
 
-    required_functions = get_required_functions(report, json_dir)
+    if required_functions is None:
+        required_functions = get_required_functions(report, json_dir)
     metric_short_names = get_metric_short_names(report.metrics)
     missing_functions = [
         fn for fn in required_functions
@@ -674,6 +773,13 @@ def run_quality_checks(report: ParsedReport, json_dir: Path) -> QualityResult:
             result.yellow_flags.append(
                 f"Function '{tc.subprogram}' TC '{tc.name}' has identical Input and Expected Values."
             )
+        elif not has_no_expected(tc):
+            shared_inputs = get_shared_contextual_inputs(tc)
+            for parent_path, name, data_type, value in sorted(shared_inputs):
+                parent_text = " > ".join(parent_path) if parent_path else "(root)"
+                result.yellow_flags.append(
+                    f"Function '{tc.subprogram}' TC '{tc.name}' has same Input/Expected value under '{parent_text}': {name}/{data_type}/{value}."
+                )
 
     no_expected_functions = get_functions_with_no_expected(report.testcases)
     for subprogram in no_expected_functions:
@@ -865,6 +971,12 @@ class ReportCertifierApp:
             return
 
         meta = parse_file_meta(selected)
+        required_functions, matched_pair, candidates = resolve_required_functions_from_meta(meta, self.json_dir)
+        if matched_pair:
+            resolved_component, resolved_unit = matched_pair
+            meta.component = resolved_component
+            meta.unit = resolved_unit
+
         self.file_name_label.config(text=meta.file_name or "-")
         self.layer_label.config(text=meta.layer or "(unknown)")
         self.component_label.config(text=meta.component or "(unknown)")
@@ -878,6 +990,20 @@ class ReportCertifierApp:
                 f"Unit={meta.unit or '(unknown)'}"
             )
         )
+
+        if not required_functions:
+            tried_text = ", ".join([f"{comp}/{unit}" for comp, unit in candidates]) or "(none)"
+            self._append_text("Component/Unit mapping not found in JSON.\n", "red")
+            self._append_text(
+                "Please check if report file has correct Component/Unit names.\n",
+                "red",
+            )
+            self._append_text(
+                f"Tried candidates: {tried_text}\n",
+                "muted",
+            )
+            self.analyze_btn.config(state="disabled")
+            return
 
         self._append_text("File loaded successfully.\n", "good")
         self._append_text("Press Analyze to run quality checks.\n", "muted")
@@ -906,7 +1032,35 @@ class ReportCertifierApp:
 
         try:
             report = parse_report(self.selected_file)
-            quality = run_quality_checks(report, self.json_dir)
+            required_functions, matched_pair, candidates = resolve_required_functions(report, self.json_dir)
+            if not required_functions:
+                parsed_component = report.meta.component or "(unknown)"
+                parsed_unit = report.meta.unit or "(unknown)"
+                tried_text = ", ".join([f"{comp}/{unit}" for comp, unit in candidates]) or "(none)"
+                messagebox.showerror(
+                    "Mapping Error",
+                    (
+                        "Could not find Component/Unit mapping in JSON.\n"
+                        f"Layer: {report.meta.layer or '(unknown)'}\n"
+                        f"Parsed: {parsed_component}/{parsed_unit}\n"
+                        f"Tried: {tried_text}\n"
+                        "Please check report filename or JSON function list."
+                    ),
+                )
+                return
+
+            if matched_pair:
+                resolved_component, resolved_unit = matched_pair
+                self.component_label.config(text=resolved_component)
+                self.unit_label.config(text=resolved_unit)
+                report.meta.component = resolved_component
+                report.meta.unit = resolved_unit
+
+            quality = run_quality_checks(
+                report,
+                self.json_dir,
+                required_functions=required_functions,
+            )
             self.render_analysis(report, quality)
         except Exception as exc:
             messagebox.showerror("Analyze Error", str(exc))
