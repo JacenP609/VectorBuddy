@@ -85,6 +85,10 @@ class TestCaseInfo:
     input_rows: List[DataRow] = field(default_factory=list)
     expected_rows: List[DataRow] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self.input_rows = self.input_rows or []
+        self.expected_rows = self.expected_rows or []
+
 
 @dataclass
 class ReportMeta:
@@ -377,6 +381,10 @@ def filter_meaningful_rows(raw_rows: List[Tuple[str, str, str, int]]) -> List[Da
             keep_next_type_after_return = False
             continue
 
+        if level >= 2:
+            filtered.append(DataRow(level=level, name=c1, data_type=c2, value=c3))
+            continue
+
     return filtered
 
 
@@ -634,14 +642,18 @@ def get_required_functions(report: ParsedReport, json_dir: Path) -> List[str]:
 # ============================================================
 
 def has_null_expected(tc: TestCaseInfo) -> bool:
-    for row in tc.expected_rows:
+    for row in get_rows_or_empty(tc.expected_rows):
         if NULL_RE.search(row.value):
             return True
     return False
 
 
 def has_no_expected(tc: TestCaseInfo) -> bool:
-    return len(tc.expected_rows) == 0
+    return len(get_rows_or_empty(tc.expected_rows)) == 0
+
+
+def get_rows_or_empty(rows: Optional[List[DataRow]]) -> List[DataRow]:
+    return rows or []
 
 
 def get_functions_with_no_expected(testcases: List[TestCaseInfo]) -> List[str]:
@@ -662,7 +674,7 @@ def get_functions_with_no_expected(testcases: List[TestCaseInfo]) -> List[str]:
 
 def build_row_signature(rows: List[DataRow]) -> List[Tuple[str, str, str]]:
     signature: List[Tuple[str, str, str]] = []
-    for row in rows:
+    for row in get_rows_or_empty(rows):
         signature.append(
             (
                 clean_text(row.name).lower(),
@@ -674,18 +686,22 @@ def build_row_signature(rows: List[DataRow]) -> List[Tuple[str, str, str]]:
 
 
 def is_input_expected_identical(tc: TestCaseInfo) -> bool:
-    if not tc.input_rows or not tc.expected_rows:
+    input_rows = get_rows_or_empty(tc.input_rows)
+    expected_rows = get_rows_or_empty(tc.expected_rows)
+    if not input_rows or not expected_rows:
         return False
-    return build_row_signature(tc.input_rows) == build_row_signature(tc.expected_rows)
+    input_signatures = get_contextual_data_signatures(input_rows)
+    expected_signatures = get_contextual_data_signatures(expected_rows)
+    return input_signatures == expected_signatures
 
 
 def get_contextual_data_signatures(
-    rows: List[DataRow],
+    rows: Optional[List[DataRow]],
 ) -> Set[Tuple[Tuple[str, ...], str, str, str]]:
     signatures: Set[Tuple[Tuple[str, ...], str, str, str]] = set()
     context_by_level: Dict[int, str] = {}
 
-    for row in rows:
+    for row in get_rows_or_empty(rows):
         level = row.level
         name = clean_text(row.name)
         data_type = clean_text(row.data_type)
@@ -769,11 +785,13 @@ def run_quality_checks(
                 f"Function '{tc.subprogram}' TC '{tc.name}' has Event Count over 200, possible Infinite Loop: {tc.event_count}."
             )
 
-        if not has_no_expected(tc) and is_input_expected_identical(tc):
-            result.yellow_flags.append(
-                f"Function '{tc.subprogram}' TC '{tc.name}' has identical Input and Expected Values."
-            )
-        elif not has_no_expected(tc):
+        if not has_no_expected(tc):
+            identical_rows = is_input_expected_identical(tc)
+            if identical_rows:
+                result.yellow_flags.append(
+                    f"Function '{tc.subprogram}' TC '{tc.name}' has identical Input and Expected Values."
+                )
+
             shared_inputs = get_shared_contextual_inputs(tc)
             for parent_path, name, data_type, value in sorted(shared_inputs):
                 parent_text = " > ".join(parent_path) if parent_path else "(root)"
